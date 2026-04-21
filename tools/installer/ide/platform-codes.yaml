@@ -190,3 +190,9 @@ platforms:
       legacy_targets:
         - .windsurf/workflows
       target_dir: .windsurf/skills
+
+  codearts:
+    name: "CodeArts"
+    preferred: false
+    installer:
+      target_dir: .codeartsdoer/skills

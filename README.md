@@ -1,3 +1,7 @@
+> **This is a fork version that adds CodeArts (Huawei Cloud AI Coding Assistant) support.**
+>
+> Original project: [bmad-code-org/BMAD-METHOD](https://github.com/bmad-code-org/BMAD-METHOD)
+
 ![BMad Method](banner-bmad-method.png)
 
 [![Version](https://img.shields.io/npm/v/bmad-method?color=blue&label=version)](https://www.npmjs.com/package/bmad-method)
