@@ -1,8 +1,8 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
-  "name": "bmad-method-codearts",
+  "name": "@super200893154/bmad-method-codearts",
   "version": "6.3.0",
-  "description": "Breakthrough Method of Agile AI-driven Development",
+  "description": "Breakthrough Method of Agile AI-driven Development (CodeArts Support)",
   "keywords": [
     "agile",
     "ai",
@@ -10,11 +10,12 @@
     "development",
     "methodology",
     "agents",
-    "bmad"
+    "bmad",
+    "codearts"
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/bmad-code-org/BMAD-METHOD.git"
+    "url": "git+https://github.com/super200893154/BMAD-METHOD.git"
   },
   "license": "MIT",
   "author": "Brian (BMad) Madison",
@@ -104,6 +105,6 @@
     "node": ">=20.0.0"
   },
   "publishConfig": {
-    "access": "public"
+    "registry": "https://npm.pkg.github.com"
   }
 }
