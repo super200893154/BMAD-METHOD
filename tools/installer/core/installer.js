@@ -11,6 +11,7 @@ const prompts = require('../prompts');
 const { BMAD_FOLDER_NAME } = require('../ide/shared/path-utils');
 const { InstallPaths } = require('./install-paths');
 const { ExternalModuleManager } = require('../modules/external-manager');
+const { resolveModuleVersion } = require('../modules/version-resolver');
 
 const { ExistingInstall } = require('./existing-install');
 
@@ -22,44 +23,6 @@ class Installer {
     this.fileOps = new FileOps();
     this.installedFiles = new Set(); // Track all installed files
     this.bmadFolderName = BMAD_FOLDER_NAME;
-  }
-
-  /**
-   * Read the module version from .claude-plugin/marketplace.json
-   * Walks up from sourcePath looking for .claude-plugin/marketplace.json
-   * @param {string} sourcePath - Module source directory
-   * @returns {string} Version string or empty string
-   */
-  async _getMarketplaceVersion(sourcePath) {
-    let dir = sourcePath;
-    for (let i = 0; i < 5; i++) {
-      const marketplacePath = path.join(dir, '.claude-plugin', 'marketplace.json');
-      if (await fs.pathExists(marketplacePath)) {
-        try {
-          const data = JSON.parse(await fs.readFile(marketplacePath, 'utf8'));
-          return this._extractMarketplaceVersion(data);
-        } catch {
-          return '';
-        }
-      }
-      const parent = path.dirname(dir);
-      if (parent === dir) break;
-      dir = parent;
-    }
-    return '';
-  }
-
-  /**
-   * Extract the highest version from marketplace.json plugins array
-   */
-  _extractMarketplaceVersion(data) {
-    const plugins = data?.plugins;
-    if (!Array.isArray(plugins) || plugins.length === 0) return '';
-    let best = '';
-    for (const p of plugins) {
-      if (p.version && (!best || p.version > best)) best = p.version;
-    }
-    return best;
   }
 
   /**
@@ -638,19 +601,40 @@ class Installer {
           moduleConfig: moduleConfig,
           installer: this,
           silent: true,
+          channelOptions: config.channelOptions,
         },
       );
 
-      // Get display name from source module.yaml; version from resolution cache or marketplace.json
-      const sourcePath = await officialModules.findModuleSource(moduleName, { silent: true });
+      // Get display name from source module.yaml and resolve the freshest version metadata we can find locally.
+      const sourcePath = await officialModules.findModuleSource(moduleName, {
+        silent: true,
+        channelOptions: config.channelOptions,
+      });
       const moduleInfo = sourcePath ? await officialModules.getModuleInfo(sourcePath, moduleName, '') : null;
       const displayName = moduleInfo?.name || moduleName;
 
-      // Prefer version from resolution cache (accurate for custom/local modules),
-      // fall back to marketplace.json walk-up for official modules
+      const externalResolution = officialModules.externalModuleManager.getResolution(moduleName);
+      let communityResolution = null;
+      if (!externalResolution) {
+        const { CommunityModuleManager } = require('../modules/community-manager');
+        communityResolution = new CommunityModuleManager().getResolution(moduleName);
+      }
+      const resolution = externalResolution || communityResolution;
       const cachedResolution = CustomModuleManager._resolutionCache.get(moduleName);
-      const version = cachedResolution?.version || (sourcePath ? await this._getMarketplaceVersion(sourcePath) : '');
-      addResult(displayName, 'ok', '', { moduleCode: moduleName, newVersion: version });
+      const versionInfo = await resolveModuleVersion(moduleName, {
+        moduleSourcePath: sourcePath,
+        fallbackVersion: resolution?.version || cachedResolution?.version,
+        marketplacePluginNames: cachedResolution?.pluginName ? [cachedResolution.pluginName] : [],
+      });
+      // Prefer the git tag recorded by the resolution (e.g. "v1.7.0") over
+      // the on-disk package.json (which may be ahead of the released tag).
+      const version = resolution?.version || versionInfo.version || '';
+      addResult(displayName, 'ok', '', {
+        moduleCode: moduleName,
+        newVersion: version,
+        newChannel: resolution?.channel || null,
+        newSha: resolution?.sha || null,
+      });
     }
   }
 
@@ -1125,12 +1109,30 @@ class Installer {
       let detail = '';
       if (r.moduleCode && r.newVersion) {
         const oldVersion = preVersions.get(r.moduleCode);
-        if (oldVersion && oldVersion === r.newVersion) {
-          detail = ` (v${r.newVersion}, no change)`;
+        // Format a version label for display:
+        //   "main" → "main @ <short-sha>" (next channel shows what SHA landed)
+        //   "v1.7.0" or "1.7.0" → "v1.7.0" (prefix 'v' when missing)
+        //   anything else (legacy strings) → as-is
+        const fmt = (v, sha) => {
+          if (typeof v !== 'string' || !v) return '';
+          if (v === 'main' || v === 'HEAD') return sha ? `main @ ${sha.slice(0, 7)}` : 'main';
+          if (/^v?\d+\.\d+\.\d+/.test(v)) return v.startsWith('v') ? v : `v${v}`;
+          return v;
+        };
+        const newV = fmt(r.newVersion, r.newSha);
+        // 'main'/'HEAD' strings only identify the channel, not the commit, so
+        // we can't assert "no change" without comparing SHAs — and preVersions
+        // doesn't carry the old SHA. Render these as a refresh instead of a
+        // false-negative "no change".
+        const isMainLike = oldVersion === 'main' || oldVersion === 'HEAD';
+        if (oldVersion && oldVersion === r.newVersion && !isMainLike) {
+          detail = ` (${newV}, no change)`;
+        } else if (oldVersion && isMainLike) {
+          detail = ` (${newV}, refreshed)`;
         } else if (oldVersion) {
-          detail = ` (v${oldVersion} → v${r.newVersion})`;
+          detail = ` (${fmt(oldVersion, r.newSha)} → ${newV})`;
         } else {
-          detail = ` (v${r.newVersion}, installed)`;
+          detail = ` (${newV}, installed)`;
         }
       } else if (r.detail) {
         detail = ` (${r.detail})`;
@@ -1250,9 +1252,59 @@ class Installer {
       await prompts.log.warn(`Skipping ${skippedModules.length} module(s) - no source available: ${skippedModules.join(', ')}`);
     }
 
+    // Build channel options from the existing manifest FIRST so the config
+    // collector below (which triggers external-module clones via
+    // findModuleSource) knows each module's recorded channel and doesn't
+    // silently redecide it. Without this, modules previously on 'next' or
+    // 'pinned' would trigger a stable-channel tag lookup at config-collection
+    // time, burning GitHub API quota and potentially failing.
+    const manifestData = await this.manifest.read(bmadDir);
+    const channelOptions = { global: null, nextSet: new Set(), pins: new Map(), warnings: [] };
+    if (manifestData?.modulesDetailed) {
+      const { fetchStableTags, classifyUpgrade, parseGitHubRepo } = require('../modules/channel-resolver');
+      for (const entry of manifestData.modulesDetailed) {
+        if (!entry?.name || !entry?.channel) continue;
+        if (entry.channel === 'pinned' && entry.version) {
+          channelOptions.pins.set(entry.name, entry.version);
+          continue;
+        }
+        if (entry.channel === 'next') {
+          channelOptions.nextSet.add(entry.name);
+          continue;
+        }
+        // Stable: classify the available upgrade. Patches and minors fall
+        // through (stable default picks up the top tag). A major upgrade
+        // requires opt-in, so under quick-update's non-interactive semantics
+        // we pin to the current version to prevent a silent breaking jump.
+        if (entry.channel === 'stable' && entry.version && entry.repoUrl) {
+          const parsed = parseGitHubRepo(entry.repoUrl);
+          if (!parsed) continue;
+          try {
+            const tags = await fetchStableTags(parsed.owner, parsed.repo);
+            if (tags.length === 0) continue;
+            const topTag = tags[0].tag;
+            const cls = classifyUpgrade(entry.version, topTag);
+            if (cls === 'major') {
+              channelOptions.pins.set(entry.name, entry.version);
+              await prompts.log.warn(
+                `${entry.name} ${entry.version} → ${topTag} is a new major release; staying on ${entry.version}. ` +
+                  `Run \`bmad install\` (Modify) with \`--pin ${entry.name}=${topTag}\` to accept.`,
+              );
+            }
+          } catch (error) {
+            // Tag lookup failed (offline, rate-limited). Stay on the current
+            // version rather than guessing — the existing cache is already
+            // at that ref, so re-using it keeps the install stable.
+            channelOptions.pins.set(entry.name, entry.version);
+            await prompts.log.warn(`Could not check ${entry.name} for updates (${error.message}); staying on ${entry.version}.`);
+          }
+        }
+      }
+    }
+
     // Load existing configs and collect new fields (if any)
     await prompts.log.info('Checking for new configuration options...');
-    const quickModules = new OfficialModules();
+    const quickModules = new OfficialModules({ channelOptions });
     await quickModules.loadExistingConfig(projectDir);
 
     let promptedForNewFields = false;
@@ -1291,6 +1343,7 @@ class Installer {
       _quickUpdate: true,
       _preserveModules: skippedModules,
       _existingModules: installedModules,
+      channelOptions,
     };
 
     await this.install(installConfig);
