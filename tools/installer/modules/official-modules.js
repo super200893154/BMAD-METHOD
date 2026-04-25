@@ -15,11 +15,6 @@ class OfficialModules {
     // Tracked during interactive config collection so {directory_name}
     // placeholder defaults can be resolved in buildQuestion().
     this.currentProjectDir = null;
-    // Install-time channel flag state. Set by Config.build once, then used as
-    // the default for every findModuleSource/cloneExternalModule call so that
-    // pre-install config collection and the install step agree on which ref
-    // to clone.
-    this.channelOptions = options.channelOptions || null;
   }
 
   /**
@@ -43,7 +38,7 @@ class OfficialModules {
    * @returns {OfficialModules}
    */
   static async build(config, paths) {
-    const instance = new OfficialModules({ channelOptions: config.channelOptions });
+    const instance = new OfficialModules();
 
     // Pre-collected by UI or quickUpdate — store and load existing for path-change detection
     if (config.moduleConfigs) {
@@ -201,12 +196,6 @@ class OfficialModules {
    * @returns {string|null} Path to the module source or null if not found
    */
   async findModuleSource(moduleCode, options = {}) {
-    // Inherit channelOptions from the install-scoped instance when the caller
-    // didn't pass one explicitly. Keeps pre-install config collection and the
-    // actual install step looking at the same git ref.
-    if (options.channelOptions === undefined && this.channelOptions) {
-      options = { ...options, channelOptions: this.channelOptions };
-    }
     const projectRoot = getProjectRoot();
 
     // Check for core module (directly under src/core-skills)
@@ -225,13 +214,13 @@ class OfficialModules {
       }
     }
 
-    // Check external official modules (pass channelOptions so channel plan applies)
+    // Check external official modules
     const externalSource = await this.externalModuleManager.findExternalModuleSource(moduleCode, options);
     if (externalSource) {
       return externalSource;
     }
 
-    // Check community modules (pass channelOptions for --next/--pin overrides)
+    // Check community modules
     const { CommunityModuleManager } = require('./community-manager');
     const communityMgr = new CommunityModuleManager();
     const communitySource = await communityMgr.findModuleSource(moduleCode, options);
@@ -269,10 +258,7 @@ class OfficialModules {
       return this.installFromResolution(resolved, bmadDir, fileTrackingCallback, options);
     }
 
-    const sourcePath = await this.findModuleSource(moduleName, {
-      silent: options.silent,
-      channelOptions: options.channelOptions,
-    });
+    const sourcePath = await this.findModuleSource(moduleName, { silent: options.silent });
     const targetPath = path.join(bmadDir, moduleName);
 
     if (!sourcePath) {
@@ -295,24 +281,11 @@ class OfficialModules {
     const manifestObj = new Manifest();
     const versionInfo = await manifestObj.getModuleVersionInfo(moduleName, bmadDir, sourcePath);
 
-    // Pick up channel resolution recorded by whichever manager did the clone.
-    const externalResolution = this.externalModuleManager.getResolution(moduleName);
-    let communityResolution = null;
-    if (!externalResolution) {
-      const { CommunityModuleManager } = require('./community-manager');
-      communityResolution = new CommunityModuleManager().getResolution(moduleName);
-    }
-    const resolution = externalResolution || communityResolution;
-
     await manifestObj.addModule(bmadDir, moduleName, {
-      version: resolution?.version || versionInfo.version,
+      version: versionInfo.version,
       source: versionInfo.source,
       npmPackage: versionInfo.npmPackage,
       repoUrl: versionInfo.repoUrl,
-      channel: resolution?.channel,
-      sha: resolution?.sha,
-      registryApprovedTag: communityResolution?.registryApprovedTag,
-      registryApprovedSha: communityResolution?.registryApprovedSha,
     });
 
     return { success: true, module: moduleName, path: targetPath, versionInfo };
@@ -360,37 +333,18 @@ class OfficialModules {
       await this.createModuleDirectories(resolved.code, bmadDir, options);
     }
 
-    // Update manifest. For custom modules, derive channel from the git ref:
-    //   cloneRef present → pinned at that ref
-    //   cloneRef absent  → next (main HEAD)
-    //   local path       → no channel concept
+    // Update manifest
     const { Manifest } = require('../core/manifest');
     const manifestObj = new Manifest();
 
-    const hasGitClone = !!resolved.repoUrl;
-    const manifestEntry = {
-      version: resolved.cloneRef || (hasGitClone ? 'main' : resolved.version || null),
+    await manifestObj.addModule(bmadDir, resolved.code, {
+      version: resolved.version || null,
       source: 'custom',
       npmPackage: null,
       repoUrl: resolved.repoUrl || null,
-    };
-    if (hasGitClone) {
-      manifestEntry.channel = resolved.cloneRef ? 'pinned' : 'next';
-      if (resolved.cloneSha) manifestEntry.sha = resolved.cloneSha;
-      if (resolved.rawInput) manifestEntry.rawSource = resolved.rawInput;
-    }
-    if (resolved.localPath) manifestEntry.localPath = resolved.localPath;
-    await manifestObj.addModule(bmadDir, resolved.code, manifestEntry);
+    });
 
-    return {
-      success: true,
-      module: resolved.code,
-      path: targetPath,
-      // Match the manifestEntry.version expression above so downstream summary
-      // lines show the cloned ref (tag or 'main') instead of the on-disk
-      // package.json version for git-backed custom installs.
-      versionInfo: { version: resolved.cloneRef || (hasGitClone ? 'main' : resolved.version || '') },
-    };
+    return { success: true, module: resolved.code, path: targetPath, versionInfo: { version: resolved.version || '' } };
   }
 
   /**
